@@ -353,6 +353,8 @@ class S3Gateway:
                 if upload_id:
                     return self.handle_abort_multipart_upload(environ, start_response, bucket, key, upload_id)
                 return self.handle_delete_object(environ, start_response, bucket, key)
+            elif method == "POST" and not key and "delete" in params:
+                return self.handle_delete_objects(environ, start_response, bucket)
 
 
             return self.send_error(start_response, "400 Bad Request", "InvalidURI", "Invalid URI")
@@ -899,6 +901,15 @@ class S3Gateway:
         dirname = os.path.dirname(key)
         basename = os.path.basename(key)
 
+        # Handle directory markers (keys ending with '/') — just ensure the folder exists
+        if not basename:
+            try:
+                self._ensure_folder(key.rstrip("/")) if key.strip("/") else None
+            except Exception as e:
+                return self.send_error(start_response, "500 Internal Error", "FolderError", str(e))
+            # MD5 of empty string, standard ETag for empty/directory objects
+            return self.send_response(start_response, "200 OK", b"", headers=[("ETag", '"d41d8cd98f00b204e9800998ecf8427e"')])
+
         # Ensure parent folder exists
         try:
             parent_id = self._ensure_folder(dirname) if dirname else None
@@ -1001,6 +1012,61 @@ class S3Gateway:
             return self.send_response(start_response, "204 No Content", b"")
         except Exception as e:
             return self.send_error(start_response, "500 Internal Error", "DeleteFailed", str(e))
+
+    def handle_delete_objects(self, environ, start_response, bucket):
+        """Handle S3 DeleteObjects (POST /bucket?delete)."""
+        if bucket != "default":
+            return self.send_error(start_response, "404 Not Found", "NoSuchBucket", "Only default bucket")
+
+        try:
+            content_length = int(environ.get("CONTENT_LENGTH", 0))
+            body = environ["wsgi.input"].read(content_length) if content_length > 0 else environ["wsgi.input"].read()
+            root = fromstring(body)
+
+            # Strip namespace for easier element lookup
+            def _localname(el):
+                tag = el.tag
+                return tag.split("}", 1)[1] if "}" in tag else tag
+
+            deleted = []
+            errors = []
+
+            for obj in root:
+                if _localname(obj) != "Object":
+                    continue
+                key_text = next((child.text for child in obj if _localname(child) == "Key"), None)
+                if not key_text:
+                    continue
+                try:
+                    entry, _, _ = self._resolve_key(key_text)
+                    if entry:
+                        self.client.delete_files([entry.id])
+                    deleted.append(key_text)
+                except Exception as e:
+                    logger.warning(f"DeleteObjects: failed to delete {key_text!r}: {e}")
+                    errors.append({"Key": key_text, "Code": "DeleteFailed", "Message": str(e)})
+
+            result_el = Element("DeleteResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+            for key_text in deleted:
+                d = Element("Deleted")
+                k = Element("Key")
+                k.text = key_text
+                d.append(k)
+                result_el.append(d)
+            for err in errors:
+                e_el = Element("Error")
+                for tag, text in err.items():
+                    child = Element(tag)
+                    child.text = text
+                    e_el.append(child)
+                result_el.append(e_el)
+
+            xml = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(result_el, encoding='utf-8')
+            return self.send_response(start_response, "200 OK", xml)
+
+        except Exception as e:
+            logger.exception("DeleteObjects error")
+            return self.send_error(start_response, "500 Internal Error", "InternalError", str(e))
 
     def handle_head_object(self, environ, start_response, bucket, key):
         """Handle HEAD request for object metadata."""
